@@ -32,6 +32,10 @@ from orbax.checkpoint import v1 as ocp_v1
 from orbax.checkpoint._src.arrays import sharding as sharding_utils
 import orbax.checkpoint.experimental.emergency.checkpoint_manager as emergency_checkpoint_manager
 import orbax.checkpoint.experimental.emergency.replicator_checkpoint_manager as emergency_replicator_checkpoint_manager
+
+from training_telemetry.context import conditional_checkpoint_save
+from training_telemetry.metrics import CheckpointMetrics, CheckPointType
+
 # pylint: disable=too-many-positional-arguments
 import dataclasses
 import json
@@ -658,13 +662,28 @@ def maybe_save_checkpoint(checkpoint_manager, state, config, data_iterator, step
   # AND the 'actual_step' is a valid step,
   # AND it's not a step that would normally trigger a checkpoint save.
   force_ckpt_save = step is None and actual_step != -1 and (actual_step % config.checkpoint_period != 0)
-
-  try:
-    checkpoint_saved = save_checkpoint(checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save)
-    if checkpoint_saved:
-      print_save_message(actual_step, config.async_checkpointing)
-  except Exception as e:
-    raise exceptions.StopTraining(f"Checkpointing failed. {str(e)}") from e
+  # Determine if we are actually saving a checkpoint in this iteration
+  is_checkpoint_saved = (
+      force_ckpt_save
+      or (config and actual_step % config.checkpoint_period == 0)
+      or (config and config.enable_emergency_checkpoint and step % config.local_checkpoint_period == 0)
+  )
+  with conditional_checkpoint_save() as checkpoint_save_span:
+    try:  
+      checkpoint_saved = save_checkpoint(checkpoint_manager, actual_step, state, config, data_iterator, force_ckpt_save)
+      if checkpoint_saved:
+        checkpoint_save_span.should_record = is_checkpoint_saved
+        checkpoint_save_span.add_metrics(
+          CheckpointMetrics.create(
+              checkpoint_type=CheckPointType.GLOBAL, # XXX: differentiate between local and global?
+              current_iteration=actual_step,
+              num_iterations=config.steps,
+              checkpoint_directory=f"{checkpoint_manager.directory}/{actual_step}",
+          )
+        )
+        print_save_message(actual_step, config.async_checkpointing)
+    except Exception as e:
+      raise exceptions.StopTraining(f"Checkpointing failed. {str(e)}") from e
 
   # Wait for any pending checkpoint save to finish during preemption or final step save
   if force_ckpt_save or checkpoint_manager.reached_preemption(actual_step):

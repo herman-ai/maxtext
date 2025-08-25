@@ -76,6 +76,26 @@ from MaxText.metric_logger import record_activation_metrics
 # pylint: disable=too-many-positional-arguments
 
 
+from training_telemetry.config_loader import load_config
+from training_telemetry.provider import Provider
+from training_telemetry.context import get_recorder, running, timed_span, training
+from training_telemetry.events import Event, EventName
+from training_telemetry.spans import SpanColor, SpanName
+from training_telemetry.verbosity import Verbosity
+from training_telemetry.metrics import EventMetrics, IterationMetrics
+
+
+
+# Initialize the telemetry provider with a default configuration
+config = load_config(
+    config_file="/opt/maxtext/scripts-sbatch/heimdall-telemetry-library-config.yaml",
+    defaults={"application": {"job_name": "jax_heimdall_test", "job_id": "1234567890", "environment": "dev"}},
+    override_from_env=False,
+)
+Provider.set_provider(config)
+
+
+
 def get_first_step(state):
   return int(state.step)
 
@@ -369,9 +389,12 @@ def eval_step(model, config, state, data, dropout_rng):
   return metrics
 
 def fail(failure_timer_start, hang_probability):
+  hang_secs = 3600
   if (datetime.datetime.now() - failure_timer_start).total_seconds() >= 300:
+    
     if py_rand.random() >= (1 - hang_probability):
-      time.sleep(3600)
+      max_logging.log(f"===Going to hang (no output) for {hang_secs/(60*60):.2f} hour.")
+      time.sleep(hang_secs)
 
     if py_rand.random() >= (1 - 0.5):
       exception = False if py_rand.random() < 0.5 else True
@@ -380,8 +403,9 @@ def fail(failure_timer_start, hang_probability):
       else:
         eval((lambda:0).__code__.replace(co_consts=()))
 
-def train_loop(config, recorder, state=None):
+def train_loop(config, recorder, training_span = None, state=None):
   """Main Training loop."""
+  
   (
       init_rng,
       checkpoint_manager,
@@ -497,6 +521,16 @@ def train_loop(config, recorder, state=None):
         max_utils.print_mem_stats("After params initialized")
 
       metric_logger.buffer_and_write_train_metrics(metrics, step, step_time_delta)
+      telemetry_metrics = IterationMetrics.create(
+                  current_iteration=step,
+                  num_iterations=1,
+                  interval=1,
+                  loss=metrics["scalar"]["learning/loss"],
+                  tflops=metrics["scalar"]["perf/per_device_tflops_per_sec"],
+                  average_iteration_time=metrics["scalar"]["perf/step_time_seconds"],
+              )
+
+      get_recorder().event(Event.create(EventName.TRAINING_ITERATIONS, metrics=telemetry_metrics), training_span)
       failure_fn()
 
     if config.save_checkpoint_on_completion:
@@ -562,7 +596,8 @@ def run(config, recorder, diagnostic_config):
       max_utils.maybe_get_transformer_engine_context(config),
       maybe_monitor_goodput(config),
   ):
-    train_loop(config, recorder)
+    with training() as training_span:
+      train_loop(config, recorder, training_span=training_span)
 
 
 def main(argv: Sequence[str]) -> None:
